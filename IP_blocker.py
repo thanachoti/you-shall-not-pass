@@ -1,10 +1,10 @@
 from flask import Flask, request, jsonify
 import os
 import ctypes
-import subprocess
 
 app = Flask(__name__)
 
+# ตรวจสอบว่าเป็น Admin หรือไม่ (เพราะการสั่ง Block Firewall ต้องใช้สิทธิ์ Admin)
 def is_admin():
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
@@ -13,62 +13,53 @@ def is_admin():
 
 @app.route('/block', methods=['POST'])
 def block_ip():
-    # --- Step 1: Receive Data ---
-    print("\n" + "="*50)
-    print("[STEP 1] 📥 Received Alert data from Graylog")
     data = request.json
+    print("\n" + "="*50)
+    print("📢 Graylog Alert Received!")
     
-    # --- Step 2: Analyze Data ---
-    print("[STEP 2] 🔍 Searching for attacker_ip from backlog...")
+    # 1. พยายามดึง IP จากข้อมูลที่ Graylog ส่งมา
     attacker_ip = None
-    backlog = data.get('backlog', [])
     
-    for index, item in enumerate(backlog):
-        fields = item.get('fields', {})
-        ip = fields.get('attacker_ip')
+    # วนลูปตรวจทุก log ใน backlog จนกว่าจะเจอ IP
+    for item in data.get('backlog', []):
+        ip = item.get('fields', {}).get('attacker_ip')
         if ip:
             attacker_ip = ip
-            print(f"      🎯 Target found! IP: {attacker_ip} (at list index {index+1})")
-            break
+            break  # เจอ IP แล้วให้หยุดค้นหาทันที
 
-    # --- Step 3: Execute Block ---
+    # 2. ถ้าเจอ IP ให้ทำการ Block ทั้ง Inbound และ Outbound
     if attacker_ip:
-        print(f"[STEP 3] 🛡️ Commanding Windows Firewall to block IP: {attacker_ip} (Inbound)")
+        print(f"🚨 TARGET DETECTED: {attacker_ip}")
         
-        rule_name = f"Graylog_Auto_Block_{attacker_ip}"
-        
-        # Prepare the command
-        cmd = [
-            "netsh", "advfirewall", "firewall", "add", "rule",
-            f"name={rule_name}",
-            "dir=in",
-            "action=block",
-            f"remoteip={attacker_ip}"
-        ]
-        
-        # Run the command and check the result
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            # 2A. สั่ง Windows Firewall บล็อก IP นี้ (ขาเข้า - INBOUND)
+            rule_name_in = f"Graylog_Block_IN_{attacker_ip}"
+            cmd_in = f"netsh advfirewall firewall add rule name=\"{rule_name_in}\" dir=in action=block remoteip={attacker_ip}"
+            os.system(cmd_in)
             
-            if result.returncode == 0:
-                print(f"[FINISHED] ✅ Block successful! Created rule name: {rule_name}")
-                return jsonify({"status": "success", "ip": attacker_ip}), 200
-            else:
-                print(f"[ERROR] ❌ Windows Firewall rejected the command: {result.stderr.strip()}")
-                return jsonify({"status": "firewall_error"}), 500
-                
+            # 2B. สั่ง Windows Firewall บล็อก IP นี้ (ขาออก - OUTBOUND) ป้องกัน Reverse Shell
+            rule_name_out = f"Graylog_Block_OUT_{attacker_ip}"
+            cmd_out = f"netsh advfirewall firewall add rule name=\"{rule_name_out}\" dir=out action=block remoteip={attacker_ip}"
+            os.system(cmd_out)
+            
+            print(f"✅ SUCCESS: {attacker_ip} has been completely isolated (Inbound & Outbound).")
+            print(f"🛠️ Rules Created: {rule_name_out}")
+            return jsonify({"status": "isolated", "ip": attacker_ip}), 200
+            
         except Exception as e:
-            print(f"[CRITICAL] ⚠️ Error occurred while running the command: {e}")
+            print(f"❌ ERROR while blocking: {e}")
             return str(e), 500
     else:
-        # --- Case: IP not found ---
-        print("[FINISHED] ⚠️ Execution ended: No IP Address found in the received data")
-        return jsonify({"status": "no_ip_found"}), 200
+        # กรณีหา IP ไม่เจอ
+        print("⚠️ No IP address found in the alert data.")
+        print("Raw Data for Debugging:", data)
+        return "IP not found", 200 
 
 if __name__ == '__main__':
     if is_admin():
-        print("🚀 [START] Server is ready (Running as Admin)")
-        print("📍 Waiting for Webhook on port 5000...")
+        print("🛡️ Python Blocker is running with Admin privileges.")
+        print("🚀 Listening for Graylog alerts on port 5000...")
         app.run(host='0.0.0.0', port=5000)
     else:
-        print("🛑 [STOP] Please run the program with Administrator privileges!")
+        print("🛑 ERROR: Please run this script as ADMINISTRATOR!")
+        print("Right-click on PowerShell/CMD and select 'Run as Administrator'")
